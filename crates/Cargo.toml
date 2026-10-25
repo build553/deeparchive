@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["backup-core", "backup-cli"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.90"
+
+[profile.release]
+# Backups run unattended on a user's machine; a panic mid-backup is a data-
+# safety incident, not a crash to shrug off. abort would skip any Drop-based
+# cleanup (e.g. leaving a half-written manifest file); unwind + our own
+# top-level error handling in backup-cli is deliberate.
+panic = "unwind"

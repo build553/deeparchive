@@ -1,0 +1,153 @@
+name: deeparchive
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deeparchive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deeparchive-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-deeparchive}
+    ports:
+      - "5432:5432"
+    volumes:
+      - deeparchive_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deeparchive} -d ${POSTGRES_DB:-deeparchive}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-deeparchive-dev}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-deeparchive-dev-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001" # console; not exposed outside localhost in any shared environment
+    volumes:
+      - deeparchive_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-deeparchive-dev}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-deeparchive-dev}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-deeparchive-dev-secret}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$$S3_ACCESS_KEY_ID\" \"$$S3_SECRET_ACCESS_KEY\" &&
+      mc mb --ignore-existing local/\"$$S3_BUCKET\"
+      "
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/docker/migrate.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-deeparchive}:${POSTGRES_PASSWORD:-deeparchive-dev-password}@postgres:5432/${POSTGRES_DB:-deeparchive}?sslmode=disable
+    command: ["up"]
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-deeparchive}:${POSTGRES_PASSWORD:-deeparchive-dev-password}@postgres:5432/${POSTGRES_DB:-deeparchive}?sslmode=disable
+      ACCESS_TOKEN_SIGNING_KEY: ${ACCESS_TOKEN_SIGNING_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:5173}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-deeparchive-dev}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-deeparchive-dev}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-deeparchive-dev-secret}
+      S3_USE_PATH_STYLE: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://${POSTGRES_USER:-deeparchive}:${POSTGRES_PASSWORD:-deeparchive-dev-password}@postgres:5432/${POSTGRES_DB:-deeparchive}?sslmode=disable
+      ACCESS_TOKEN_SIGNING_KEY: ${ACCESS_TOKEN_SIGNING_KEY}
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-deeparchive-dev}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-deeparchive-dev}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-deeparchive-dev-secret}
+      S3_USE_PATH_STYLE: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      RETENTION_SWEEP_INTERVAL: ${RETENTION_SWEEP_INTERVAL:-1h}
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        VITE_CONTACT_EMAIL: ${VITE_CONTACT_EMAIL:-}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Matches CORS_ALLOWED_ORIGINS (http://localhost:5173) so this
+      # production-style build works with no extra config. Day-to-day
+      # frontend development should use `make dev-web` (Vite's dev
+      # server, with hot reload) instead of rebuilding this image on
+      # every change.
+      - "5173:8080"
+
+volumes:
+  deeparchive_postgres_data:
+  deeparchive_minio_data:
+
+# NOTE: the desktop app (apps/desktop) has no code yet — still a later
+# milestone. See docs/implementation-status.md.

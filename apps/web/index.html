@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DeepArchive</title>
+    <script>
+      // Runs before first paint so an explicit theme choice doesn't flash
+      // the system default for one frame — see src/lib/theme.ts, the only
+      // other place that reads/writes this key.
+      (function () {
+        var resolved = "dark";
+        try {
+          var stored = localStorage.getItem("deeparchive.theme");
+          if (stored === "light" || stored === "dark") {
+            resolved = stored;
+          } else if (window.matchMedia("(prefers-color-scheme: light)").matches) {
+            resolved = "light";
+          }
+        } catch (e) {}
+        document.documentElement.dataset.theme = resolved;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "backup-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Real end-to-end backup client: authenticates against the Go API, scans/chunks/encrypts via backup-core, uploads only new chunks to object storage via short-lived presigned URLs, commits snapshots, and restores."
+
+[dependencies]
+backup-core = { path = "../backup-core" }
+# TLS via rustls rather than the system's native TLS library — no OpenSSL
+# dev headers required to build this binary.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ed25519 device identity. backup-core deliberately has no notion of device
+# identity (that is a protocol/transport concern, not a filesystem/crypto
+# library concern), so this lives here instead.
+ed25519-dalek = "2"
+getrandom = "0.4.3"
+base64 = "0.23.1"
+hex = "0.4.3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"

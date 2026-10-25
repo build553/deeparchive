@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS snapshot_chunks;
+DROP TABLE IF EXISTS snapshots;
+DROP TABLE IF EXISTS chunks;

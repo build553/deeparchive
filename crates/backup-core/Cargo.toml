@@ -1,0 +1,28 @@
+[package]
+name = "backup-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Filesystem scanning, content-defined chunking, client-side encryption, and the backup manifest format. Pure library: no network, no CLI — see ../backup-cli."
+
+[dependencies]
+# Content-defined chunking: files are split on content boundaries (not fixed
+# offsets), so inserting a byte near the start of a large file does not
+# invalidate every chunk after it — the whole point of chunk-level dedup.
+fastcdc = "5.0.0"
+# Directory walking with .gitignore-style exclude patterns — the same crate
+# ripgrep uses, rather than hand-rolling glob matching.
+ignore = "0.4.33"
+aes-gcm = "0.11.1"
+argon2 = "0.6.0"
+sha2 = "0.11.1"
+getrandom = "0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4.3"
+base64 = "0.23.1"
+thiserror = "2.0.21"
+time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+
+[dev-dependencies]
+tempfile = "3"

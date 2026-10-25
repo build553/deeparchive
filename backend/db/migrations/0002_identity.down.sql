@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS mfa_recovery_codes;
+DROP TABLE IF EXISTS mfa_credentials;
+DROP TABLE IF EXISTS password_reset_tokens;
+DROP TABLE IF EXISTS email_verification_tokens;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS invitations;
+DROP TABLE IF EXISTS memberships;
+DROP TABLE IF EXISTS organizations;
+DROP TABLE IF EXISTS users;

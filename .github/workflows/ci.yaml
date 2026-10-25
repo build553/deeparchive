@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: backend/go.sum
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test (unit, race)
+        run: go test -race -short ./...
+
+  backend-integration:
+    runs-on: ubuntu-latest
+    needs: backend
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: deeparchive
+          POSTGRES_PASSWORD: deeparchive-ci-password
+          POSTGRES_DB: deeparchive
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U deeparchive -d deeparchive"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgres://deeparchive:deeparchive-ci-password@localhost:5432/deeparchive?sslmode=disable
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: deeparchive-dev
+      S3_ACCESS_KEY_ID: deeparchive-dev
+      S3_SECRET_ACCESS_KEY: deeparchive-dev-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: backend/go.sum
+      - name: start MinIO
+        # GitHub Actions' native `services:` containers can't be given a
+        # command (minio/minio needs `server /data`), so this reuses the
+        # same minio + minio-init bucket-creation definitions compose.yaml
+        # already has, rather than reinventing them here.
+        working-directory: .
+        run: docker compose up -d minio minio-init
+      - name: run migrations
+        run: go run ./cmd/migrate up
+      - name: integration tests
+        run: |
+          if ls tests/integration/*.go >/dev/null 2>&1; then
+            go test -race -tags=integration ./tests/integration/...
+          else
+            echo "no integration tests yet"
+          fi
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "9.15.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - name: typecheck
+        run: pnpm --filter web typecheck
+      - name: lint
+        run: pnpm --filter web lint
+      - name: build
+        run: pnpm --filter web build
+
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate OpenAPI spec
+        uses: char0n/swagger-editor-validate@v1
+        with:
+          definition-file: backend/api/openapi.yaml

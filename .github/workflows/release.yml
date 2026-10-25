@@ -1,0 +1,105 @@
+name: Release deepctl and deepctl-admin
+
+# Triggered by pushing a version tag: git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Both binaries are pure Go — deepctl talks only to the HTTP API,
+    # deepctl-admin only to Postgres (pgx/v5) and S3-compatible storage
+    # (minio-go) — no cgo anywhere, so every target below cross-compiles
+    # natively from one Linux runner. No per-OS runners, no cross
+    # toolchain, just GOOS/GOARCH.
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: backend/go.sum
+
+      - name: build deepctl and deepctl-admin
+        working-directory: backend
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          ext=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
+          mkdir -p dist
+          # Bake the hosted API URL into deepctl so users never type
+          # --server. Set the DEEPARCHIVE_SERVER_URL repository variable;
+          # if unset, the binary keeps its localhost dev default.
+          server_flag=""
+          if [ -n "${{ vars.DEEPARCHIVE_SERVER_URL }}" ]; then
+            server_flag="-X main.defaultServer=${{ vars.DEEPARCHIVE_SERVER_URL }}"
+          fi
+          go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }} ${server_flag}" \
+            -o "dist/deepctl${ext}" ./cmd/deepctl
+          go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o "dist/deepctl-admin${ext}" ./cmd/deepctl-admin
+
+      - name: package
+        working-directory: backend/dist
+        run: |
+          for bin in deepctl deepctl-admin; do
+            name="${bin}-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+            if [ "${{ matrix.goos }}" = "windows" ]; then
+              zip "$GITHUB_WORKSPACE/${name}.zip" "${bin}.exe"
+            else
+              tar -czf "$GITHUB_WORKSPACE/${name}.tar.gz" "$bin"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            deepctl-*.tar.gz
+            deepctl-*.zip
+            deepctl-admin-*.tar.gz
+            deepctl-admin-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # "deepctl-${{ github.ref_name }}-*" (anchored on the version right
+          # after the dash) so it can't also glob-match
+          # "deepctl-admin-${{ github.ref_name }}-*" — gh errors if the same
+          # file is passed twice, which a bare "deepctl-*" would do here.
+          gh release create "${{ github.ref_name }}" \
+            "artifacts/deepctl-${{ github.ref_name }}-"*.tar.gz "artifacts/deepctl-${{ github.ref_name }}-"*.zip \
+            "artifacts/deepctl-admin-${{ github.ref_name }}-"*.tar.gz "artifacts/deepctl-admin-${{ github.ref_name }}-"*.zip \
+            --title "deepctl ${{ github.ref_name }}" \
+            --generate-notes

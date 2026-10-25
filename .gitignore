@@ -1,0 +1,41 @@
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Go
+backend/bin/
+*.test
+*.out
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+
+# Playwright
+apps/web/test-artifacts/
+apps/web/blob-report/
+
+# Rust
+target/
+Cargo.lock
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+
+# Local dev volumes
+infra/storage/data/
+infra/compose/.data/

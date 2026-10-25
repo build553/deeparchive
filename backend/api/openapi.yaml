@@ -1,0 +1,1206 @@
+openapi: 3.1.0
+info:
+  title: DeepArchive API
+  version: "1.0.0"
+  description: >
+    Encrypted cloud backup platform API. This specification grows alongside
+    the implementation; see docs/implementation-status.md for which routes
+    below are implemented versus specified-but-not-yet-built. Routes are
+    added to this file in the same change that implements them.
+
+    Schemas here are hand-written from the actual Go handler/service code
+    (backend/internal/{identity,devices,backups,organizations,usage}),
+    not the other way around — if this file and the Go code ever
+    disagree, the Go code is right and this file is stale.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+    description: Registration, login, sessions, password, MFA.
+  - name: Me
+    description: The caller's own account.
+  - name: Devices
+    description: >
+      Backup agents (backup-cli instances), not browser sessions. Enrolled
+      via Ed25519 keypair + challenge/response, never from this HTTP API
+      alone — see docs/backup-protocol.md.
+  - name: Backups
+    description: >
+      Snapshots and the chunk-upload negotiate/commit protocol. The server
+      never sees plaintext — see docs/encryption.md.
+  - name: Organizations
+    description: Shared accounts with role-based membership.
+  - name: Usage
+    description: Storage usage versus quota.
+
+paths:
+  /status:
+    get:
+      tags: [Auth]
+      summary: Public service status
+      operationId: getStatus
+      security: []
+      responses:
+        "200":
+          description: Service status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: { type: string }
+                  api_version: { type: string }
+                  environment: { type: string }
+                  server_time: { type: string, format: date-time }
+                required: [service, api_version, environment, server_time]
+
+  # --- Auth ---------------------------------------------------------
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new account
+      operationId: register
+      security: []
+      description: >
+        Always returns 202 with the same message whether or not the email
+        is already registered, to resist account enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 12 }
+                display_name: { type: string }
+              required: [email, password, display_name]
+      responses:
+        "202": { $ref: "#/components/responses/Message" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /auth/verify-email:
+    post:
+      tags: [Auth]
+      summary: Verify an email address
+      operationId: verifyEmail
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { token: { type: string } }
+              required: [token]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "400":
+          description: Invalid request, or invalid/expired token (code `invalid_or_expired_token`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/resend-verification:
+    post:
+      tags: [Auth]
+      summary: Resend the verification email
+      operationId: resendVerification
+      security: []
+      description: Enumeration-resistant, same as /auth/register.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { email: { type: string, format: email } }
+              required: [email]
+      responses:
+        "202": { $ref: "#/components/responses/Message" }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                mfa_code:
+                  type: string
+                  description: Required if the account has MFA enabled, or if a previous attempt returned `mfa_required`.
+              required: [email, password]
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: >
+            `invalid_credentials`, `mfa_required` (resubmit with `mfa_code`),
+            or `account_locked` (too many recent failed attempts).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: "`account_suspended` or `account_deactivated`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate an access/refresh token pair
+      operationId: refreshSession
+      security: []
+      description: >
+        Rotates the refresh token. Presenting an already-rotated-away
+        token within its short grace window revokes the entire session
+        family (replay detection).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { refresh_token: { type: string } }
+              required: [refresh_token]
+      responses:
+        "200":
+          description: New session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Request a password reset email
+      operationId: forgotPassword
+      security: []
+      description: Enumeration-resistant, same as /auth/register.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { email: { type: string, format: email } }
+              required: [email]
+      responses:
+        "202": { $ref: "#/components/responses/Message" }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Reset a password with a reset token
+      operationId: resetPassword
+      security: []
+      description: Single-use token; revokes all of the account's sessions on success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token: { type: string }
+                new_password: { type: string, minLength: 12 }
+              required: [token, new_password]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "400":
+          description: "`invalid_or_expired_token` or `weak_password`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out the current session
+      operationId: logout
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+
+  /auth/logout-all:
+    post:
+      tags: [Auth]
+      summary: Log out every session
+      operationId: logoutAll
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+
+  /auth/password/change:
+    post:
+      tags: [Auth]
+      summary: Change the current password
+      operationId: changePassword
+      description: Requires the current password; revokes every other session on success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 12 }
+              required: [current_password, new_password]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "400":
+          description: "`weak_password`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: "`invalid_credentials` (wrong current password)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/mfa/enroll:
+    post:
+      tags: [Auth]
+      summary: Start TOTP (MFA) enrollment
+      operationId: enrollMfa
+      description: Starts TOTP enrollment. Must be followed by /auth/mfa/confirm to actually enable it.
+      responses:
+        "200":
+          description: TOTP secret and provisioning URI
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string }
+                  uri: { type: string, description: "otpauth:// URI" }
+                required: [secret, uri]
+
+  /auth/mfa/confirm:
+    post:
+      tags: [Auth]
+      summary: Confirm TOTP enrollment and enable MFA
+      operationId: confirmMfa
+      description: Requires a live valid TOTP code before enabling MFA. Returns one-time recovery codes, shown only once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { code: { type: string } }
+              required: [code]
+      responses:
+        "200":
+          description: MFA enabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recovery_codes:
+                    type: array
+                    items: { type: string }
+                required: [recovery_codes]
+        "400":
+          description: "`invalid_code` or `mfa_not_enrolled`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/mfa:
+    delete:
+      tags: [Auth]
+      summary: Disable MFA
+      operationId: disableMfa
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+
+  /auth/mfa/recovery:
+    post:
+      tags: [Auth]
+      summary: Redeem a one-time MFA recovery code
+      operationId: redeemRecoveryCode
+      description: Each recovery code is single-use.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { code: { type: string } }
+              required: [code]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "400":
+          description: "`invalid_code` (invalid or already-used)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/sessions:
+    get:
+      tags: [Auth]
+      summary: List active sessions
+      operationId: listSessions
+      responses:
+        "200":
+          description: Active sessions for the caller
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/SessionSummary" }
+                required: [sessions]
+
+  /auth/sessions/{sessionID}:
+    delete:
+      tags: [Auth]
+      summary: Revoke one session
+      operationId: revokeSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /auth/sessions/revoke-others:
+    post:
+      tags: [Auth]
+      summary: Revoke every other session
+      operationId: revokeOtherSessions
+      description: Revokes every session except the one making this request.
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+
+  # --- Me -------------------------------------------------------------
+
+  /me:
+    get:
+      tags: [Me]
+      summary: Get the caller's own account
+      operationId: getMe
+      responses:
+        "200":
+          description: The caller's own account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+    patch:
+      tags: [Me]
+      summary: Update the caller's display name
+      operationId: updateMe
+      description: Updates display_name only — email has no change-with-reverification flow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { display_name: { type: string } }
+              required: [display_name]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+    delete:
+      tags: [Me]
+      summary: Deactivate the caller's own account
+      operationId: deactivateMe
+      description: >
+        Soft delete: sets status=deactivated and revokes every session.
+        Does not erase account data — see docs/implementation-status.md's
+        Milestone 2 section for why this is deactivation, not row deletion.
+        Requires the current password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { password: { type: string } }
+              required: [password]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "401":
+          description: "`invalid_credentials` (wrong password)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # --- Devices ----------------------------------------------------------
+
+  /devices:
+    get:
+      tags: [Devices]
+      summary: List devices visible to the caller
+      operationId: listDevices
+      description: Devices owned by the caller, or belonging to an organization they're a member of.
+      responses:
+        "200":
+          description: Devices visible to the caller
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+                required: [devices]
+
+  /devices/enroll:
+    post:
+      tags: [Devices]
+      summary: Enroll a new device
+      operationId: enrollDevice
+      description: Starts a device in `pending` status. Call /devices/{id}/approve next.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                os: { type: string }
+                client_version: { type: string }
+                public_key: { type: string, description: "base64-encoded raw 32-byte Ed25519 public key" }
+              required: [name, public_key]
+      responses:
+        "201":
+          description: Device enrolled (pending)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+
+  /devices/{deviceID}:
+    parameters:
+      - $ref: "#/components/parameters/DeviceID"
+    get:
+      tags: [Devices]
+      summary: Get a device
+      operationId: getDevice
+      responses:
+        "200":
+          description: Device detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Devices]
+      summary: Rename a device
+      operationId: renameDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { name: { type: string } }
+              required: [name]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+    delete:
+      tags: [Devices]
+      summary: Revoke a device
+      operationId: revokeDevice
+      description: >
+        Revocation takes effect immediately: a live-revocation check on
+        every device-authenticated request, not just at token expiry.
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+
+  /devices/{deviceID}/approve:
+    post:
+      tags: [Devices]
+      summary: Approve a pending device
+      operationId: approveDevice
+      description: >
+        For an org-scoped device, requires the caller to hold the owner
+        or admin role in that organization — a plain member (even the
+        device's own enrolling user) cannot self-approve. Personal
+        devices have no admin concept and approve freely.
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "403":
+          description: Plain member attempting to approve an org-scoped device
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /devices/{deviceID}/challenge:
+    post:
+      tags: [Devices]
+      summary: Issue a device authentication challenge
+      operationId: issueDeviceChallenge
+      security: []
+      description: >
+        Unauthenticated by design: the device has no session yet, which
+        is the problem this flow solves. Issues a short-lived, single-use
+        random nonce the device must sign with its Ed25519 private key.
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      responses:
+        "200":
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challenge_id: { type: string, format: uuid }
+                  nonce: { type: string, description: base64-encoded 32-byte random nonce }
+                required: [challenge_id, nonce]
+        "403":
+          description: "`device_revoked`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /devices/{deviceID}/authenticate:
+    post:
+      tags: [Devices]
+      summary: Authenticate a device with a signed challenge
+      operationId: authenticateDevice
+      security: []
+      description: Exchanges a signed challenge for a short-lived device-scoped access token.
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                challenge_id: { type: string, format: uuid }
+                signature: { type: string, description: base64-encoded Ed25519 signature over the nonce }
+              required: [challenge_id, signature]
+      responses:
+        "200":
+          description: Device access token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                required: [access_token, expires_at]
+        "401":
+          description: "`invalid_signature` or `invalid or expired challenge`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /devices/{deviceID}/heartbeat:
+    post:
+      tags: [Devices]
+      summary: Record a device heartbeat
+      operationId: deviceHeartbeat
+      description: >
+        Called by the device itself (device bearer token, not a user
+        session) to record that it's alive.
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "401":
+          description: Invalid device token, or `device has been revoked`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # --- Backups ----------------------------------------------------------
+
+  /backups:
+    get:
+      tags: [Backups]
+      summary: List the caller's snapshots
+      operationId: listMyBackups
+      description: The caller's own snapshots, across every device, plus any organization-scoped ones they can see.
+      responses:
+        "200":
+          description: Snapshots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Snapshot" }
+                required: [snapshots]
+
+  /backups/{snapshotID}:
+    parameters:
+      - $ref: "#/components/parameters/SnapshotID"
+    get:
+      tags: [Backups]
+      summary: Get a snapshot's detail and chunk download URLs
+      operationId: getSnapshot
+      description: Returns the encrypted manifest plus a presigned download URL per referenced chunk.
+      responses:
+        "200":
+          description: Snapshot detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotDetail" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Backups]
+      summary: Delete a snapshot
+      operationId: deleteSnapshot
+      description: >
+        Garbage-collects any chunk no longer referenced by any other
+        snapshot — removed from object storage and the database, not
+        just unlinked.
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /devices/{deviceID}/backups:
+    parameters:
+      - $ref: "#/components/parameters/DeviceID"
+    get:
+      tags: [Backups]
+      summary: List a device's snapshots
+      operationId: listDeviceBackups
+      description: User-session-authed (viewing history), unlike negotiate/commit below.
+      responses:
+        "200":
+          description: Snapshots for this device
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Snapshot" }
+                required: [snapshots]
+    post:
+      tags: [Backups]
+      summary: Commit a new snapshot
+      operationId: commitSnapshot
+      description: >
+        Device-token-authed (the backup agent itself, not a user
+        session). Every referenced chunk not already known to the server
+        is verified via a real object-storage Stat call before anything
+        is written — see docs/backup-protocol.md.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                manifest_nonce: { type: string, description: base64 }
+                manifest_ciphertext: { type: string, description: base64 }
+                total_size: { type: integer, format: int64 }
+                chunks:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      hash: { type: string, description: "hex SHA-256 of the plaintext chunk" }
+                      ciphertext_size: { type: integer, format: int64 }
+                    required: [hash, ciphertext_size]
+              required: [manifest_nonce, manifest_ciphertext, total_size, chunks]
+      responses:
+        "201":
+          description: Snapshot committed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Snapshot" }
+        "409":
+          description: "`chunk_not_uploaded` — a referenced chunk was never actually uploaded"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: "`quota_exceeded`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /devices/{deviceID}/backups/negotiate:
+    post:
+      tags: [Backups]
+      summary: Negotiate which chunks need uploading
+      operationId: negotiateUpload
+      description: >
+        Device-token-authed. For each proposed content hash, reports
+        whether it's already known in this device's dedup scope, and if
+        not, a presigned PUT URL to upload it to.
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chunk_hashes:
+                  type: array
+                  items: { type: string }
+              required: [chunk_hashes]
+      responses:
+        "200":
+          description: Per-hash status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        hash: { type: string }
+                        exists: { type: boolean }
+                        object_key: { type: string }
+                        upload_url:
+                          type: string
+                          description: Presigned PUT URL; present only when exists is false.
+                      required: [hash, exists, object_key]
+                required: [chunks]
+
+  # --- Organizations ------------------------------------------------
+
+  /organizations:
+    get:
+      tags: [Organizations]
+      summary: List the caller's organizations
+      operationId: listOrganizations
+      responses:
+        "200":
+          description: Organizations the caller belongs to
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Organization" }
+                required: [organizations]
+    post:
+      tags: [Organizations]
+      summary: Create an organization
+      operationId: createOrganization
+      description: Transactional — the organization and the caller's owner membership are created atomically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { name: { type: string } }
+              required: [name]
+      responses:
+        "201":
+          description: Organization created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Organization" }
+
+  /organizations/{organizationID}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationID"
+    get:
+      tags: [Organizations]
+      summary: Get an organization
+      operationId: getOrganization
+      description: >
+        Returns ErrNotFound (not ErrForbidden) for non-members, so a
+        probe can't distinguish "exists but you're not in it" from
+        "doesn't exist".
+      responses:
+        "200":
+          description: Organization detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organization: { $ref: "#/components/schemas/Organization" }
+                  your_role: { type: string, enum: [owner, admin, member] }
+                required: [organization, your_role]
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Organizations]
+      summary: Rename an organization
+      operationId: renameOrganization
+      description: Owner/admin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { name: { type: string } }
+              required: [name]
+      responses:
+        "200":
+          description: Updated organization
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Organization" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /organizations/{organizationID}/members:
+    get:
+      tags: [Organizations]
+      summary: List an organization's members
+      operationId: listMembers
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+                required: [members]
+
+  /organizations/{organizationID}/invitations:
+    post:
+      tags: [Organizations]
+      summary: Invite a member to an organization
+      operationId: inviteMember
+      description: Owner/admin only. Role must be admin or member — never owner (ownership isn't transferable through invitations).
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                role: { type: string, enum: [admin, member] }
+              required: [email, role]
+      responses:
+        "202": { $ref: "#/components/responses/Message" }
+        "400":
+          description: "`invalid_request` (bad role)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /organizations/{organizationID}/members/{userID}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationID"
+      - name: userID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Organizations]
+      summary: Change a member's role
+      operationId: updateMemberRole
+      description: Owner/admin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { role: { type: string, enum: [admin, member] } }
+              required: [role]
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "409":
+          description: "`last_owner` — cannot demote the organization's sole owner"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Organizations]
+      summary: Remove a member from an organization
+      operationId: removeMember
+      description: Owner/admin only.
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "409":
+          description: "`last_owner` — cannot remove the organization's sole owner"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /organizations/{organizationID}/leave:
+    post:
+      tags: [Organizations]
+      summary: Leave an organization
+      operationId: leaveOrganization
+      description: >
+        A sole owner cannot leave — promote another member to owner
+        first (there is no one-step "transfer ownership and leave").
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "409":
+          description: "`last_owner`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /invitations/accept:
+    post:
+      tags: [Organizations]
+      summary: Accept an organization invitation
+      operationId: acceptInvitation
+      description: The invitation's email must case-insensitively match the authenticated account's email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { token: { type: string } }
+              required: [token]
+      responses:
+        "200":
+          description: Joined organization
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Organization" }
+        "400":
+          description: "`invalid_or_expired_token` or `email mismatch`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # --- Usage --------------------------------------------------------
+
+  /usage:
+    get:
+      tags: [Usage]
+      summary: Get storage usage versus quota
+      operationId: getUsage
+      description: The caller's own storage usage/quota, plus the same for every organization they belong to.
+      responses:
+        "200":
+          description: Usage report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageReport" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        A user-session access token (from /auth/login or /auth/refresh)
+        for most routes, or a device-scoped token (from
+        /devices/{id}/authenticate) for the device-authed backup routes
+        — see each operation's description for which it expects.
+
+  parameters:
+    DeviceID:
+      name: deviceID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SnapshotID:
+      name: snapshotID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SessionID:
+      name: sessionID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OrganizationID:
+      name: organizationID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Message:
+      description: Generic success acknowledgement
+      content:
+        application/json:
+          schema:
+            type: object
+            properties: { message: { type: string } }
+            required: [message]
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+          required: [code, message]
+      required: [error]
+
+    Session:
+      type: object
+      properties:
+        access_token: { type: string }
+        access_expires_at: { type: string, format: date-time }
+        refresh_token: { type: string }
+        refresh_expires_at: { type: string, format: date-time }
+      required: [access_token, access_expires_at, refresh_token, refresh_expires_at]
+
+    Me:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        email_verified: { type: boolean }
+        mfa_enabled: { type: boolean }
+        status: { type: string, enum: [active, suspended, deactivated] }
+      required: [id, email, display_name, email_verified, mfa_enabled, status]
+
+    SessionSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_agent: { type: string }
+        ip_address: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+      required: [id, user_agent, ip_address, created_at, last_used_at, expires_at]
+
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        name: { type: string }
+        os: { type: string }
+        client_version: { type: string }
+        status: { type: string, enum: [pending, active, revoked] }
+        registered_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+      required: [id, user_id, name, os, client_version, status, registered_at]
+
+    Snapshot:
+      type: object
+      description: >
+        manifest_nonce/manifest_ciphertext are opaque to the server —
+        decrypting them requires the vault passphrase, which the server
+        never has. See docs/encryption.md.
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        manifest_nonce: { type: string, description: base64 }
+        manifest_ciphertext: { type: string, description: base64 }
+        total_size: { type: integer, format: int64 }
+        chunk_count: { type: integer }
+        created_at: { type: string, format: date-time }
+      required:
+        [id, device_id, user_id, manifest_nonce, manifest_ciphertext, total_size, chunk_count, created_at]
+
+    ChunkLocation:
+      type: object
+      properties:
+        hash: { type: string }
+        download_url: { type: string, description: "Presigned GET URL, short-lived." }
+      required: [hash, download_url]
+
+    SnapshotDetail:
+      allOf:
+        - $ref: "#/components/schemas/Snapshot"
+        - type: object
+          properties:
+            chunks:
+              type: array
+              items: { $ref: "#/components/schemas/ChunkLocation" }
+          required: [chunks]
+
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        owner_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+      required: [id, name, slug, owner_id, created_at]
+
+    Member:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        role: { type: string, enum: [owner, admin, member] }
+        created_at: { type: string, format: date-time }
+      required: [user_id, email, display_name, role, created_at]
+
+    ScopeUsage:
+      type: object
+      properties:
+        used_bytes: { type: integer, format: int64 }
+        quota_bytes: { type: integer, format: int64 }
+      required: [used_bytes, quota_bytes]
+
+    OrganizationUsage:
+      allOf:
+        - $ref: "#/components/schemas/ScopeUsage"
+        - type: object
+          properties:
+            organization_id: { type: string, format: uuid }
+            name: { type: string }
+          required: [organization_id, name]
+
+    UsageReport:
+      type: object
+      properties:
+        personal: { $ref: "#/components/schemas/ScopeUsage" }
+        organizations:
+          type: array
+          items: { $ref: "#/components/schemas/OrganizationUsage" }
+      required: [personal, organizations]
